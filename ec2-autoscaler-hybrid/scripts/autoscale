@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_FILE="${ROOT_DIR}/config/config.json"
+
+require_jq() {
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is required. Install with: sudo apt-get update && sudo apt-get install -y jq" >&2
+    exit 1
+  fi
+}
+
+require_config() {
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    echo "Missing config file: ${CONFIG_FILE}" >&2
+    exit 1
+  fi
+}
+
+atomic_update() {
+  local filter="$1"
+  local tmp
+  tmp="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")"
+  jq "${filter}" "${CONFIG_FILE}" > "${tmp}"
+  mv "${tmp}" "${CONFIG_FILE}"
+}
+
+positive_int() {
+  local value="$1"
+  [[ "${value}" =~ ^[0-9]+$ ]] && [[ "${value}" -ge 1 ]]
+}
+
+status() {
+  jq '{enabled,min_running,region,tag_filter,scale_out,scale_in}' "${CONFIG_FILE}"
+}
+
+main() {
+  require_jq
+  require_config
+
+  local cmd="${1:-}"
+  case "${cmd}" in
+    set-min)
+      local value="${2:-}"
+      if ! positive_int "${value}"; then
+        echo "set-min requires positive integer" >&2
+        exit 1
+      fi
+      atomic_update ".min_running = ${value}"
+      echo "min_running=${value}"
+      ;;
+    pause)
+      atomic_update '.enabled = false'
+      echo "enabled=false"
+      ;;
+    resume)
+      atomic_update '.enabled = true'
+      echo "enabled=true"
+      ;;
+    status)
+      status
+      ;;
+    *)
+      echo "Usage: autoscale {set-min <n>|pause|resume|status}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

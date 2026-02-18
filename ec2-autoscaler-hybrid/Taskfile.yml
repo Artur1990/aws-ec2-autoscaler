@@ -1,0 +1,39 @@
+version: "3"
+
+tasks:
+  init:
+    desc: Initialize local config and logs
+    cmds:
+      - mkdir -p config logs
+      - if [ ! -f config/config.json ]; then cp config/config.json.example config/config.json; fi
+
+  up:
+    desc: Start services
+    cmds:
+      - task: init
+      - docker compose up -d --build
+
+  down:
+    desc: Stop services
+    cmds:
+      - docker compose down
+
+  logs:
+    desc: Tail compose logs
+    cmds:
+      - docker compose logs -f
+
+  status:
+    desc: Show compose status
+    cmds:
+      - docker compose ps
+
+  test:
+    desc: Run autoscaler unit tests
+    cmds:
+      - docker compose run --rm autoscaler pytest -q
+
+  lint:
+    desc: Basic Python syntax check
+    cmds:
+      - docker compose run --rm autoscaler python -m py_compile src/*.py

@@ -23,7 +23,7 @@
     },
     {
       "parameters": {
-        "filePath": "/opt/ec2-autoscaler/config/config.json",
+        "filePath": "/home/node/.n8n-files/config/config.json",
         "dataPropertyName": "config"
       },
       "id": "readConfig",

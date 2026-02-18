@@ -1,0 +1,114 @@
+{
+  "name": "ec2-autoscaler",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "cron-node",
+      "name": "Cron every 5m",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "filePath": "/opt/ec2-autoscaler/config.json",
+        "dataPropertyName": "configFile"
+      },
+      "id": "read-config-node",
+      "name": "Read config file",
+      "type": "n8n-nodes-base.readBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const binary = $input.first().binary?.configFile;\nif (!binary?.data) {\n  throw new Error('config.json is missing or empty');\n}\n\nconst content = Buffer.from(binary.data, 'base64').toString('utf8');\nlet config;\ntry {\n  config = JSON.parse(content);\n} catch (error) {\n  throw new Error(`Invalid JSON in config.json: ${error.message}`);\n}\n\nconst required = ['enabled', 'min_running', 'region', 'tag_filter', 'scale_out', 'scale_in'];\nfor (const key of required) {\n  if (!(key in config)) throw new Error(`Missing config key: ${key}`);\n}\n\nreturn [{ json: config }];"
+      },
+      "id": "parse-config-node",
+      "name": "Parse config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const AWS = require('aws-sdk');\nconst fs = require('fs');\n\nconst config = $input.first().json;\nconst now = new Date();\nconst nowIso = now.toISOString();\nconst logPath = '/opt/ec2-autoscaler/logs/autoscaler.log';\nconst statePath = '/opt/ec2-autoscaler/state.json';\n\nfunction asNumber(value, name) {\n  const num = Number(value);\n  if (!Number.isFinite(num)) throw new Error(`Config field ${name} must be a number`);\n  return num;\n}\n\nfunction isTrueTag(value) {\n  return String(value || '').toLowerCase() === 'true';\n}\n\nfunction tagsToMap(tags) {\n  const map = {};\n  for (const tag of tags || []) {\n    map[tag.Key] = tag.Value;\n  }\n  return map;\n}\n\nfunction loadState() {\n  try {\n    const raw = fs.readFileSync(statePath, 'utf8');\n    const parsed = JSON.parse(raw);\n    return {\n      last_start_at: parsed.last_start_at || null,\n      last_stop_at: parsed.last_stop_at || null\n    };\n  } catch (_) {\n    return { last_start_at: null, last_stop_at: null };\n  }\n}\n\nfunction saveState(state) {\n  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));\n}\n\nfunction cooldownPassed(lastIso, cooldownMinutes) {\n  if (!lastIso) return true;\n  const diffMs = now.getTime() - new Date(lastIso).getTime();\n  return diffMs >= cooldownMinutes * 60 * 1000;\n}\n\nasync function listInstancesByState(ec2, stateName, tagFilter) {\n  const Filters = [\n    { Name: 'instance-state-name', Values: [stateName] },\n    ...Object.entries(tagFilter || {}).map(([k, v]) => ({ Name: `tag:${k}`, Values: [String(v)] }))\n  ];\n\n  let NextToken;\n  const instances = [];\n\n  do {\n    const resp = await ec2.describeInstances({ Filters, NextToken }).promise();\n    for (const reservation of resp.Reservations || []) {\n      for (const instance of reservation.Instances || []) {\n        instances.push(instance);\n      }\n    }\n    NextToken = resp.NextToken;\n  } while (NextToken);\n\n  return instances;\n}\n\nasync function getCpuAverage(cw, instanceId, windowMinutes, periodSeconds = 300) {\n  const end = now;\n  const start = new Date(now.getTime() - windowMinutes * 60 * 1000);\n\n  const resp = await cw.getMetricStatistics({\n    Namespace: 'AWS/EC2',\n    MetricName: 'CPUUtilization',\n    Dimensions: [{ Name: 'InstanceId', Value: instanceId }],\n    StartTime: start,\n    EndTime: end,\n    Period: periodSeconds,\n    Statistics: ['Average']\n  }).promise();\n\n  const points = (resp.Datapoints || []).map(p => p.Average).filter(v => typeof v === 'number');\n  if (!points.length) return null;\n  return points.reduce((a, b) => a + b, 0) / points.length;\n}\n\nfunction appendLog(line) {\n  fs.mkdirSync('/opt/ec2-autoscaler/logs', { recursive: true });\n  fs.appendFileSync(logPath, `${line}\\n`);\n}\n\nif (!config.enabled) {\n  const msg = `[${nowIso}] SKIP enabled=false`;\n  appendLog(msg);\n  return [{ json: { status: 'skipped', reason: 'enabled=false', message: msg } }];\n}\n\nconst region = process.env.AWS_REGION || config.region;\nif (!region) throw new Error('AWS region is not set in config.region or AWS_REGION env');\n\nAWS.config.update({\n  region,\n  accessKeyId: process.env.AWS_ACCESS_KEY_ID,\n  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY\n});\n\nconst ec2 = new AWS.EC2({ region });\nconst cw = new AWS.CloudWatch({ region });\nconst state = loadState();\n\nconst minRunning = asNumber(config.min_running, 'min_running');\nconst startCount = asNumber(config.scale_out.start_count ?? 1, 'scale_out.start_count');\nconst stopCount = asNumber(config.scale_in.stop_count ?? 1, 'scale_in.stop_count');\n\nconst runningInstances = await listInstancesByState(ec2, 'running', config.tag_filter);\nconst runningWithTags = runningInstances.map(i => ({\n  id: i.InstanceId,\n  tags: tagsToMap(i.Tags)\n}));\n\nconst runningCount = runningWithTags.length;\nconst runningCpuForScaleOut = [];\nfor (const inst of runningWithTags) {\n  const cpu = await getCpuAverage(cw, inst.id, asNumber(config.scale_out.window_minutes, 'scale_out.window_minutes'));\n  if (cpu !== null) runningCpuForScaleOut.push({ id: inst.id, cpu });\n}\n\nconst avgCpu = runningCpuForScaleOut.length\n  ? runningCpuForScaleOut.reduce((a, b) => a + b.cpu, 0) / runningCpuForScaleOut.length\n  : 0;\nconst maxCpu = runningCpuForScaleOut.length\n  ? Math.max(...runningCpuForScaleOut.map(x => x.cpu))\n  : 0;\n\nlet startedIds = [];\nlet stoppedIds = [];\n\nconst scaleOutCondition = (\n  avgCpu > asNumber(config.scale_out.avg_cpu_threshold, 'scale_out.avg_cpu_threshold') ||\n  maxCpu > asNumber(config.scale_out.max_cpu_threshold, 'scale_out.max_cpu_threshold')\n);\n\nif (scaleOutCondition && cooldownPassed(state.last_start_at, asNumber(config.scale_out.cooldown_minutes, 'scale_out.cooldown_minutes'))) {\n  const stoppedInstances = await listInstancesByState(ec2, 'stopped', config.tag_filter);\n  const sortable = stoppedInstances.map(i => {\n    const tags = tagsToMap(i.Tags);\n    const rawPriority = Number(tags.Priority);\n    const priority = Number.isFinite(rawPriority) ? rawPriority : 999;\n    return { id: i.InstanceId, priority };\n  });\n\n  sortable.sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));\n  startedIds = sortable.slice(0, startCount).map(x => x.id);\n\n  if (startedIds.length > 0) {\n    await ec2.startInstances({ InstanceIds: startedIds }).promise();\n    state.last_start_at = nowIso;\n  }\n}\n\nconst stopCooldownPassed = cooldownPassed(state.last_stop_at, asNumber(config.scale_in.cooldown_minutes, 'scale_in.cooldown_minutes'));\nif (runningCount > minRunning && stopCooldownPassed) {\n  const stopCandidates = [];\n  for (const inst of runningWithTags) {\n    if (isTrueTag(inst.tags.NeverStop)) continue;\n    const idleCpu = await getCpuAverage(cw, inst.id, asNumber(config.scale_in.window_minutes, 'scale_in.window_minutes'));\n    if (idleCpu === null) continue;\n    if (idleCpu < asNumber(config.scale_in.cpu_threshold, 'scale_in.cpu_threshold')) {\n      stopCandidates.push({ id: inst.id, cpu: idleCpu });\n    }\n  }\n\n  stopCandidates.sort((a, b) => a.cpu - b.cpu || a.id.localeCompare(b.id));\n  const maxAllowedStops = Math.max(0, runningCount - minRunning);\n  const toStop = Math.min(stopCount, maxAllowedStops);\n  stoppedIds = stopCandidates.slice(0, toStop).map(x => x.id);\n\n  if (stoppedIds.length > 0) {\n    await ec2.stopInstances({ InstanceIds: stoppedIds }).promise();\n    state.last_stop_at = nowIso;\n  }\n}\n\nsaveState(state);\n\nconst report = `[${nowIso}] region=${region} running=${runningCount} avgCPU=${avgCpu.toFixed(2)} maxCPU=${maxCpu.toFixed(2)} started=${startedIds.join(',') || '-'} stopped=${stoppedIds.join(',') || '-'}`;\nappendLog(report);\n\nreturn [{\n  json: {\n    status: 'ok',\n    timestamp: nowIso,\n    region,\n    running_count: runningCount,\n    avg_cpu: Number(avgCpu.toFixed(2)),\n    max_cpu: Number(maxCpu.toFixed(2)),\n    started_instances: startedIds,\n    stopped_instances: stoppedIds,\n    report\n  }\n}];"
+      },
+      "id": "autoscaler-node",
+      "name": "Scale logic + AWS actions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Cron every 5m": {
+      "main": [
+        [
+          {
+            "node": "Read config file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read config file": {
+      "main": [
+        [
+          {
+            "node": "Parse config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse config": {
+      "main": [
+        [
+          {
+            "node": "Scale logic + AWS actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "ec2-autoscaler-v1",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "id": "ec2-autoscaler"
+}
+

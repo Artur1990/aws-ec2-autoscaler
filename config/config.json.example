@@ -1,0 +1,23 @@
+{
+  "enabled": true,
+  "min_running": 2,
+  "region": "eu-central-1",
+  "tag_filter": {
+    "AutoScale": "true",
+    "Role": "worker"
+  },
+  "scale_out": {
+    "avg_cpu_threshold": 65,
+    "max_cpu_threshold": 80,
+    "window_minutes": 15,
+    "cooldown_minutes": 15,
+    "start_count": 1
+  },
+  "scale_in": {
+    "cpu_threshold": 5,
+    "window_minutes": 60,
+    "cooldown_minutes": 60,
+    "stop_count": 1
+  }
+}
+

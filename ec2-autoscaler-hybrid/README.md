@@ -1,7 +1,7 @@
 # ec2-autoscaler-hybrid
 
 Hybrid architecture:
-- n8n = orchestration UI + config visibility
+- n8n = UI + optional heartbeat workflow
 - Python (boto3) = scaling decisions, AWS actions, audit logging, tests
 
 No secrets in code. Secrets are injected from `.env`.
@@ -140,14 +140,14 @@ JSONL fields include:
 - `ts`, `action`, `instance_id`, `reason`, `evidence`, `thresholds`, `windows`,
 - `min_running`, `running_count_before`, `running_count_after`, `tags`.
 
-## n8n workflow role
+## n8n workflow role (simplified)
 
 `workflows/ec2-autoscaler.json`:
-- Cron every 5 minutes,
-- reads mounted config,
-- if `enabled=false`, appends decision record to decisions log and exits.
+- Cron every 5 minutes.
+- Runs a simple heartbeat Code node.
 
-This keeps n8n as observer/orchestrator UI while autoscaler executes AWS logic safely in dedicated Python service.
+All AWS scaling logic is executed only by the `autoscaler` service.
+This removes file-access complexity from n8n and keeps the project simple and stable.
 
 ## scripts/autoscale usage
 
@@ -198,6 +198,8 @@ task lint
 
 ## Troubleshooting
 
+- n8n file access errors:
+  - not applicable in simplified mode (workflow does not read host files).
 - AccessDenied:
   - verify IAM actions and tag conditions.
 - No metrics:
